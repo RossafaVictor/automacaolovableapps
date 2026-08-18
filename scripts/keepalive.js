@@ -31,7 +31,7 @@ const PADRAO_SUPABASE = process.env.SUPABASE_HOST_PATTERN || '.supabase.';
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || undefined;
 
 const ARTIFACTS = path.join(__dirname, '..', 'artifacts');
-const MAX_TENTATIVAS = 2;
+const MAX_TENTATIVAS = 3;
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -84,17 +84,46 @@ async function tentarLogin(tentativa) {
 
   try {
     log(`Tentativa ${tentativa}: abrindo ${APP_URL}`);
-    await page.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // networkidle garante que os chunks de JS do app terminaram de baixar.
+    await page.goto(APP_URL, { waitUntil: 'networkidle', timeout: 60000 })
+      .catch(() => page.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }));
 
     const campoEmail = page.locator('input[type="email"]').first();
     const campoSenha = page.locator('input[type="password"]').first();
     const botaoEntrar = page.locator('button[type="submit"]').first();
 
     await campoEmail.waitFor({ state: 'visible', timeout: 30000 });
-    log('Formulario de login carregado.');
+    log('Formulario de login renderizado.');
+
+    // O app e SSR (TanStack Start): o HTML do formulario chega antes do React
+    // assumir o controle. Se clicarnos nesse intervalo, o navegador faz um submit
+    // nativo (a URL vira /login?) e nada chega ao Supabase. Esperamos ate que o
+    // React tenha hidratado o botao antes de preencher qualquer coisa.
+    await page
+      .waitForFunction(
+        () => {
+          const el = document.querySelector('button[type="submit"]') || document.querySelector('form');
+          if (!el) return false;
+          return Object.keys(el).some((k) => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+        },
+        { timeout: 30000 }
+      )
+      .then(() => log('React hidratado.'))
+      .catch(() => log('Nao detectei a hidratacao do React; seguindo com espera fixa.'));
+    await page.waitForTimeout(3000);
 
     await campoEmail.fill(EMAIL);
     await campoSenha.fill(PASSWORD);
+    await page.waitForTimeout(500);
+
+    // Confere que o React nao limpou os campos (sinal de hidratacao tardia).
+    const preenchido = await campoEmail.inputValue();
+    if (preenchido !== EMAIL) {
+      log('Campos foram resetados apos o preenchimento; preenchendo de novo.');
+      await campoEmail.fill(EMAIL);
+      await campoSenha.fill(PASSWORD);
+      await page.waitForTimeout(500);
+    }
     log('Credenciais preenchidas. Enviando...');
 
     await Promise.all([
@@ -107,7 +136,7 @@ async function tentarLogin(tentativa) {
     await page.waitForTimeout(8000);
 
     const urlFinal = page.url();
-    const saiuDoLogin = !/\/login\/?$/.test(urlFinal);
+    const saiuDoLogin = !/\/login\/?(\?.*)?$/.test(urlFinal);
     log(`URL apos login: ${urlFinal}`);
     log(`Chamadas ao Supabase observadas: ${chamadasSupabase.length}`);
     chamadasSupabase.slice(0, 8).forEach((c) => log(`  ${c.status} ${c.url}`));
@@ -121,6 +150,14 @@ async function tentarLogin(tentativa) {
     const autenticou = chamadasSupabase.some((c) => c.status >= 200 && c.status < 400);
 
     if (!autenticou) {
+      // /login? com query string vazia = o formulario fez submit nativo,
+      // ou seja, o React ainda nao estava no controle da pagina.
+      if (/\/login\?/.test(urlFinal) && chamadasSupabase.length === 0) {
+        throw new Error(
+          'O formulario fez submit nativo (URL virou /login?) - o React nao tinha hidratado ainda. ' +
+          'Vale aumentar a espera antes do clique.'
+        );
+      }
       throw new Error(
         'Nenhuma resposta bem-sucedida do Supabase foi observada. ' +
         'O login provavelmente falhou (credenciais alteradas?) ou o projeto ja esta pausado.'
@@ -166,4 +203,3 @@ async function tentarLogin(tentativa) {
   console.error(`FALHA: o keepalive nao conseguiu acordar o Supabase. Ultimo erro: ${ultimoErro.message}`);
   process.exit(1);
 })();
-
