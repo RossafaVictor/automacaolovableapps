@@ -1,0 +1,71 @@
+name: Supabase Keepalive
+
+# Roda segunda e quinta as 09:00 UTC = 06:00 no horario de Brasilia.
+# Intervalo maximo entre execucoes: 4 dias - folga confortavel contra
+# o limite de 7 dias de inatividade do plano free do Supabase.
+on:
+  schedule:
+    - cron: '0 9 * * 1,4'
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Instalar Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Acordar o Supabase (login no app)
+        env:
+          APP_URL: ${{ vars.APP_URL || 'https://eggquality.lovable.app/login' }}
+          APP_EMAIL: ${{ secrets.APP_EMAIL }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: npm run keepalive
+
+      # Screenshot so e publicado quando algo da errado, para nao expor
+      # dados do sistema em execucoes normais. Retencao curta.
+      - name: Guardar screenshot em caso de falha
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falha-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 5
+          if-no-files-found: ignore
+
+      # Grava a data da ultima execucao bem-sucedida. Serve como log visivel
+      # e mantem o repositorio ativo - o GitHub desativa workflows agendados
+      # depois de 60 dias sem nenhuma atividade no repo.
+      - name: Registrar ultima execucao
+        if: success()
+        run: |
+          mkdir -p logs
+          date -u '+%Y-%m-%d %H:%M:%S UTC' > logs/ultima-execucao.txt
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add logs/ultima-execucao.txt
+          git diff --staged --quiet || git commit -m 'chore: keepalive executado [skip ci]'
+          git push
